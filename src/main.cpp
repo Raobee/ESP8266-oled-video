@@ -12,8 +12,11 @@ U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 
 #define U8LOG_WIDTH 20
 #define U8LOG_HEIGHT 6
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 uint8_t u8log_buffer[U8LOG_WIDTH * U8LOG_HEIGHT];
 U8G2LOG u8g2log;
+uint8_t imgmem[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
 
 // Select the FileSystem by uncommenting one of the lines below
 //#define USE_SPIFFS
@@ -47,6 +50,22 @@ File uploadFile;
 static const char TEXT_PLAIN[] PROGMEM = "text/plain";
 static const char FS_INIT_ERROR[] PROGMEM = "FS INIT ERROR";
 static const char FILE_NOT_FOUND[] PROGMEM = "FileNotFound";
+ESP8266WebServer server(80);
+//Wifi settings
+WiFiMode_t wifi_mode = WIFI_AP; //default work in AP mode
+char APssid[64] = "esp8266AP";
+char APpassword[64] = "12345678";
+char STAssid[64] = "your-wifi";
+char STApassword[64] = "";
+bool PlayFlag = false;
+uint8_t imgWidth = 0;
+uint8_t imgHeight = 0;
+uint8_t player_mode = 1;
+char LocalFilePath[32] = "/LocalFilePath";
+uint8_t LocalFileFPS = 5;            //default local player FPS
+char Client_Server_Address[64] = ""; //default Client-mode Server address
+int Client_Server_Port = 8002;       //default Client-mode Server port
+int Server_Listen_Port = 8001;       //default Server-mode Server port
 
 #ifdef USE_SPIFFS
 /*
@@ -71,8 +90,6 @@ String checkForUnsupportedPath(String filename)
   return error;
 }
 #endif
-
-ESP8266WebServer server(80);
 
 ////////////////////////////////
 // Utils to return HTTP codes, and determine content-type
@@ -103,22 +120,17 @@ void replyServerError(String msg)
   server.send(500, FPSTR(TEXT_PLAIN), msg + "\r\n");
 }
 
-WiFiMode_t wifi_mode = WIFI_AP; //default work in AP mode
-char APssid[64] = "esp8266AP";
-char APpassword[64] = "12345678";
-char STAssid[64] = "your-wifi";
-char STApassword[64] = "";
-
-void initWifi()
+void readConfig()
 {
-  delay(100);
+  //WiFi config
+  File wifiConfigFile;
   if (!fileSystem->exists("/wifi-config.json"))
   {
     Serial.println("Can't open wifi-config，will auto generate.");
-    File fp1 = fileSystem->open("/wifi-config.json", "w+");
-    fp1.close(); //关闭释放指针
+    wifiConfigFile = fileSystem->open("/wifi-config.json", "w+");
+    wifiConfigFile.close(); //关闭释放指针
   }
-  File wifiConfigFile = fileSystem->open("/wifi-config.json", "r");
+  wifiConfigFile = fileSystem->open("/wifi-config.json", "r");
   if (wifiConfigFile)
   { //  Read wifi settings
     size_t size = wifiConfigFile.size();
@@ -151,17 +163,76 @@ void initWifi()
       }
     }
     jsonBuffer.clear(); //Clear json buffer
-    wifiConfigFile.close();
     Serial.println("Read wifi-config successfully.");
-    u8g2log.println("Read wifi-config successfully");
-    u8g2log.println("/wifi-config.json");
+    u8g2log.println("Read /wifi-config.json successfully");
   }
   else
   {
     Serial.println("Read wifi-config failed. Use default.");
-    u8g2log.println("Read failed.Use default.");
-    u8g2log.println("/wifi-config.json");
+    u8g2log.println("Read /wifi-config.json failed.Use default.");
   }
+  wifiConfigFile.close();
+
+  //Player config
+  File playerConfigFile;
+  if (!fileSystem->exists("/player-config.json"))
+  {
+    Serial.println("Can't open player-config，will auto generate.");
+    playerConfigFile = fileSystem->open("/player-config.json", "w+");
+    playerConfigFile.close(); //关闭释放指针
+  }
+  playerConfigFile = fileSystem->open("/player-config.json", "r");
+  if (playerConfigFile)
+  { //  Read wifi settings
+    size_t size = playerConfigFile.size();
+    // Allocate a buffer to store contents of the file.
+    std::unique_ptr<char[]> buf(new char[size]);
+    playerConfigFile.readBytes(buf.get(), size);
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject &json = jsonBuffer.parseObject(buf.get());
+    if (json.success())
+    {
+      if (json.containsKey("mode"))
+      { //mode: 1->Local , 2->Client , 3->Server
+        player_mode = json["mode"].as<int>();
+      }
+      if (json.containsKey("LocalFilePath"))
+      {
+        strcpy(LocalFilePath, json["LocalFilePath"].as<char *>());
+      }
+      if (json.containsKey("LocalFileFPS"))
+      {
+        LocalFileFPS = json["LocalFileFPS"].as<int>();
+      }
+      if (json.containsKey("Client_Server_Address"))
+      {
+        strcpy(Client_Server_Address, json["Client_Server_Address"].as<char *>());
+      }
+      if (json.containsKey("Client_Server_Port"))
+      {
+        Client_Server_Port = json["Client_Server_Port"].as<int>();
+      }
+      if (json.containsKey("Server_Listen_Port"))
+      {
+        Server_Listen_Port = json["Server_Listen_Port"].as<int>();
+      }
+    }
+    jsonBuffer.clear(); //Clear json buffer
+    Serial.println("Read player-config successfully.");
+    u8g2log.println("Read /player-config.json successfully");
+  }
+  else
+  {
+    Serial.println("Read player-config failed. Use default.");
+    u8g2log.println("Read /player-config.json failed.Use default.");
+  }
+  playerConfigFile.close();
+}
+
+void initWifi()
+{
+  delay(100);
+
   WiFi.mode(wifi_mode);
   if (wifi_mode > 1)
   {
@@ -204,8 +275,10 @@ void handleRoot()
 {
   u8g2log.println((String) "HTTP Request on " + (String)server.uri());
   char temp[2048];
-  char checked[][8] = {"", "", ""};
-  strcpy(checked[wifi_mode - 1], "checked");
+  char wifi_checked[][8] = {"", "", ""};
+  char player_checked[][8] = {"", "", ""};
+  strcpy(wifi_checked[wifi_mode - 1], "checked");
+  strcpy(player_checked[player_mode - 1], "checked");
   snprintf(temp, 2048, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP8266 Config Page</title></head><body>\
 <form action=\"api/submit_config?config_type=WIFI\" method=\"post\">\
 <h2>WiFi Mode Select</h2><label><input type=\"radio\" name=\"WIFImode\" value=\"1\" %s>STA</label></br>\
@@ -218,15 +291,19 @@ Password: <input type=\"text\" name=\"APpassword\" value=\"%s\"></br>\
 <input type=\"submit\" value=\"Submit\">\
 </form><form action=\"api/submit_config?config_type=Player\" method=\"post\">\
 <h2>Player Configuration</h2>\
-<h2>Player Mode Select</h2><label><input type=\"radio\" name=\"Playermode\" value=\"1\" %s>Local</label></br>\
+<h3>Player Mode Select</h3><label><input type=\"radio\" name=\"Playermode\" value=\"1\" %s>Local</label></br>\
 <label><input type=\"radio\" name=\"Playermode\" value=\"2\" %s>Client</label></br>\
 <label><input type=\"radio\" name=\"Playermode\" value=\"3\" %s>Server</label></br>\
-<h3>Client-mode Configuration</h3>Server address:<input type=\"text\" name=\"Player_Client_Server\"></br>\
-Port: <input type=\"text\" name=\"Player_Client_Port\"></br>\
+<h3>Local-mode Configuration</h3>File Path:<input type=\"text\" name=\"Player_Local_Filepath\" value=\"%s\"></br>\
+FPS: <input type=\"text\" name=\"Player_Local_FPS\" value=\"%d\"></br>\
+<h3>Client-mode Configuration</h3>Server address:<input type=\"text\" name=\"Player_Client_Server\" value=\"%s\"></br>\
+Port: <input type=\"text\" name=\"Player_Client_Port\" value=\"%d\"></br>\
+<h3>Server-mode Configuration</h3>\
+Port: <input type=\"text\" name=\"Player_Server_Port\" value=\"%d\"></br>\
 <input type=\"submit\" value=\"Submit\">\
 </form></body></html>\
-",
-           checked[0], checked[1], checked[2], STAssid, STApassword, APssid, APpassword);
+",wifi_checked[0], wifi_checked[1], wifi_checked[2], STAssid, STApassword, APssid, APpassword,
+player_checked[0], player_checked[1], player_checked[2],LocalFilePath,LocalFileFPS,Client_Server_Address,Client_Server_Port,Server_Listen_Port);
   server.send(200, "text/html", temp);
 }
 
@@ -256,14 +333,14 @@ void handleSubmitConfig()
     {
       if (postargs["config_type"].as<String>() == String("WIFI"))
       {
-        wifi_mode = WIFI_AP; //default work in AP mode
+        wifi_mode = (WiFiMode_t)postargs["WIFImode"].as<int>();
         strcpy(STAssid, postargs["STASSID"].as<String>().c_str());
         strcpy(STApassword, postargs["STApassword"].as<String>().c_str());
         strcpy(APssid, postargs["APSSID"].as<String>().c_str());
         strcpy(APpassword, postargs["APpassword"].as<String>().c_str());
         DynamicJsonBuffer WIFIconfbuf;
         JsonObject &wificonfjson = WIFIconfbuf.createObject();
-        wificonfjson.set("mode", postargs["WIFImode"].as<String>());
+        wificonfjson.set("mode", wifi_mode);
         wificonfjson.set("STAssid", STAssid);
         wificonfjson.set("STApassword", STApassword);
         wificonfjson.set("APssid", APssid);
@@ -273,6 +350,30 @@ void handleSubmitConfig()
         File wificonffilep = fileSystem->open("/wifi-config.json", "w");
         wificonffilep.write(WIFIjsonfile.c_str());
         wificonffilep.close();
+        WIFIconfbuf.clear();
+      }
+      if (postargs["config_type"].as<String>() == String("Player"))
+      {
+        player_mode = postargs["Playermode"].as<int>();
+        strcpy(LocalFilePath, postargs["Player_Local_Filepath"].as<String>().c_str());
+        LocalFileFPS = postargs["Player_Local_FPS"].as<int>();
+        strcpy(Client_Server_Address, postargs["Player_Client_Server"].as<String>().c_str());
+        Client_Server_Port = postargs["Player_Client_Port"].as<int>();
+        Server_Listen_Port = postargs["Player_Server_Port"].as<int>();
+        DynamicJsonBuffer PLAYERconfbuf;
+        JsonObject &playerconfjson = PLAYERconfbuf.createObject();
+        playerconfjson.set("mode", player_mode);
+        playerconfjson.set("LocalFilePath", LocalFilePath);
+        playerconfjson.set("LocalFileFPS", LocalFileFPS);
+        playerconfjson.set("Client_Server_Address", Client_Server_Address);
+        playerconfjson.set("Client_Server_Port", Client_Server_Port);
+        playerconfjson.set("Server_Listen_Port", Server_Listen_Port);
+        String PLAYERjsonfile;
+        playerconfjson.printTo(PLAYERjsonfile);
+        File playerconffilep = fileSystem->open("/player-config.json", "w");
+        playerconffilep.write(PLAYERjsonfile.c_str());
+        playerconffilep.close();
+        PLAYERconfbuf.clear();
       }
     }
     postargsbuf.clear();
@@ -483,6 +584,47 @@ void handleFileUpload()
   }
 }
 
+int hex2byte(unsigned char bits[], char s[]) //uchar* destination bits, char* source HEX
+{
+  int i, n = 0;
+  for (i = 0; s[i]; i += 2)
+  {
+    if ((s[i] >= 'A' && s[i] <= 'F') || (s[i] >= 'a' && s[i] <= 'f'))
+    {
+      if (s[i] <= 'F')
+        bits[n] = s[i] - 'A' + 10;
+      else
+        bits[n] = s[i] - 'a' + 10;
+    }
+    else
+      bits[n] = s[i] - '0';
+    if ((s[i + 1] >= 'A' && s[i + 1] <= 'F') || (s[i + 1] >= 'a' && s[i + 1] <= 'f'))
+    {
+      if (s[i + 1] <= 'F')
+        bits[n] = (bits[n] << 4) | (s[i + 1] - 'A' + 10);
+      else
+        bits[n] = (bits[n] << 4) | (s[i + 1] - 'a' + 10);
+    }
+    else
+      bits[n] = (bits[n] << 4) | (s[i + 1] - '0');
+    ++n;
+  }
+  return n;
+}
+
+void freshDisplay()
+{
+  u8g2.firstPage();
+  do
+  {
+    u8g2.drawXBM((SCREEN_WIDTH - imgWidth) / 2, (SCREEN_HEIGHT - imgHeight) / 2, imgWidth, imgHeight, imgmem);
+  } while (u8g2.nextPage());
+}
+
+void ClientMode()
+{
+}
+
 void setup()
 {
 
@@ -504,6 +646,7 @@ void setup()
   fsOK = fileSystem->begin();
   DBG_OUTPUT_PORT.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
   u8g2log.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
+  readConfig(); // Read configs
   initWifi(); /*
   while (WiFi.status() != WL_CONNECTED)
   {
