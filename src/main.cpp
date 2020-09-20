@@ -145,7 +145,7 @@ void initWifi()
       {
         strcpy(STAssid, json["STAssid"].as<char *>());
       }
-      if (json.containsKey("APssid"))
+      if (json.containsKey("STApassword"))
       {
         strcpy(STApassword, json["STApassword"].as<char *>());
       }
@@ -171,8 +171,8 @@ void initWifi()
   {
     WiFi.begin(STAssid, STApassword);
   }
-  DBG_OUTPUT_PORT.println(String("Wifi set done!Mode:")+String(wifi_mode)+String("\nAP_SSID:")+String(APssid)+String("\nAP_Password")+String(APpassword)+String("\nSTA_SSID:")+String(STAssid));
-  u8g2log.println(String("Wifi set done!Mode:")+String(wifi_mode)+String("\nAP_SSID:")+String(APssid)+String("\nAP_Password")+String(APpassword)+String("\nSTA_SSID:")+String(STAssid));
+  DBG_OUTPUT_PORT.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
+  u8g2log.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
 }
 
 void deleteRecursive(String path)
@@ -203,20 +203,26 @@ void deleteRecursive(String path)
 void handleRoot()
 {
   u8g2log.println((String) "HTTP Request on " + (String)server.uri());
-  char temp[1024];
+  char temp[2048];
   char checked[][8] = {"", "", ""};
   strcpy(checked[wifi_mode - 1], "checked");
-  snprintf(temp, 1024, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP8266 Config Page</title></head><body>\
-<form action=\"submit_config\" method=\"post\">\
-<h2>WiFi Mode Select</h2><label><input type=\"radio\" name=\"mode\" value=\"1\" %s>STA</label></br>\
-<label><input type=\"radio\" name=\"mode\" value=\"2\" %s>AP</label></br>\
-<label><input type=\"radio\" name=\"mode\" value=\"3\" %s>STA+AP</label></br>\
-<h3>STA Mode Configuration</h3></br>SSID: <input type=\"text\" name=\"STASSID\" value=\"%s\"></br>\
+  snprintf(temp, 2048, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP8266 Config Page</title></head><body>\
+<form action=\"api/submit_config?config_type=WIFI\" method=\"post\">\
+<h2>WiFi Mode Select</h2><label><input type=\"radio\" name=\"WIFImode\" value=\"1\" %s>STA</label></br>\
+<label><input type=\"radio\" name=\"WIFImode\" value=\"2\" %s>AP</label></br>\
+<label><input type=\"radio\" name=\"WIFImode\" value=\"3\" %s>STA+AP</label></br>\
+<h3>STA Mode Configuration</h3>SSID: <input type=\"text\" name=\"STASSID\" value=\"%s\"></br>\
 Password: <input type=\"text\" name=\"STApassword\" value=\"%s\"></br>\
-<h3>AP Mode Configuration</h3></br>SSID: <input type=\"text\" name=\"APSSID\" value=\"%s\"></br>\
+<h3>AP Mode Configuration</h3>SSID: <input type=\"text\" name=\"APSSID\" value=\"%s\"></br>\
 Password: <input type=\"text\" name=\"APpassword\" value=\"%s\"></br>\
-<h3>Server Configuration</h3>\
-Server: <input type=\"text\" name=\"Server\"></br>Port: <input type=\"text\" name=\"Port\">\
+<input type=\"submit\" value=\"Submit\">\
+</form><form action=\"api/submit_config?config_type=Player\" method=\"post\">\
+<h2>Player Configuration</h2>\
+<h2>Player Mode Select</h2><label><input type=\"radio\" name=\"Playermode\" value=\"1\" %s>Local</label></br>\
+<label><input type=\"radio\" name=\"Playermode\" value=\"2\" %s>Client</label></br>\
+<label><input type=\"radio\" name=\"Playermode\" value=\"3\" %s>Server</label></br>\
+<h3>Client-mode Configuration</h3>Server address:<input type=\"text\" name=\"Player_Client_Server\"></br>\
+Port: <input type=\"text\" name=\"Player_Client_Port\"></br>\
 <input type=\"submit\" value=\"Submit\">\
 </form></body></html>\
 ",
@@ -246,9 +252,30 @@ void handleSubmitConfig()
       message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
       postargs.set(server.argName(i), server.arg(i));
     }
-    if (postargs.containsKey("WIFI"))
+    if (postargs.containsKey("config_type"))
     {
+      if (postargs["config_type"].as<String>() == String("WIFI"))
+      {
+        wifi_mode = WIFI_AP; //default work in AP mode
+        strcpy(STAssid, postargs["STASSID"].as<String>().c_str());
+        strcpy(STApassword, postargs["STApassword"].as<String>().c_str());
+        strcpy(APssid, postargs["APSSID"].as<String>().c_str());
+        strcpy(APpassword, postargs["APpassword"].as<String>().c_str());
+        DynamicJsonBuffer WIFIconfbuf;
+        JsonObject &wificonfjson = WIFIconfbuf.createObject();
+        wificonfjson.set("mode", postargs["WIFImode"].as<String>());
+        wificonfjson.set("STAssid", STAssid);
+        wificonfjson.set("STApassword", STApassword);
+        wificonfjson.set("APssid", APssid);
+        wificonfjson.set("APpassword", APpassword);
+        String WIFIjsonfile;
+        wificonfjson.printTo(WIFIjsonfile);
+        File wificonffilep = fileSystem->open("/wifi-config.json", "w");
+        wificonffilep.write(WIFIjsonfile.c_str());
+        wificonffilep.close();
+      }
     }
+    postargsbuf.clear();
     server.send(200, "text/plain", message);
   }
 }
