@@ -39,6 +39,7 @@ SDFSConfig fileSystemConfig = SDFSConfig();
 #else
 #error Please select a filesystem first by uncommenting one of the "#define USE_xxx" lines at the beginning of the sketch.
 #endif
+
 #define DBG_OUTPUT_PORT Serial
 static bool fsOK;
 String unsupportedFiles = String();
@@ -46,6 +47,30 @@ File uploadFile;
 static const char TEXT_PLAIN[] PROGMEM = "text/plain";
 static const char FS_INIT_ERROR[] PROGMEM = "FS INIT ERROR";
 static const char FILE_NOT_FOUND[] PROGMEM = "FileNotFound";
+
+#ifdef USE_SPIFFS
+/*
+   Checks filename for character combinations that are not supported by FSBrowser (alhtough valid on SPIFFS).
+   Returns an empty String if supported, or detail of error(s) if unsupported
+*/
+String checkForUnsupportedPath(String filename)
+{
+  String error = String();
+  if (!filename.startsWith("/"))
+  {
+    error += F("!NO_LEADING_SLASH! ");
+  }
+  if (filename.indexOf("//") != -1)
+  {
+    error += F("!DOUBLE_SLASH! ");
+  }
+  if (filename.endsWith("/"))
+  {
+    error += F("!TRAILING_SLASH! ");
+  }
+  return error;
+}
+#endif
 
 ESP8266WebServer server(80);
 
@@ -77,7 +102,6 @@ void replyServerError(String msg)
   DBG_OUTPUT_PORT.println(msg);
   server.send(500, FPSTR(TEXT_PLAIN), msg + "\r\n");
 }
-
 
 WiFiMode_t wifi_mode = WIFI_AP; //default work in AP mode
 char APssid[64] = "esp8266AP";
@@ -130,13 +154,13 @@ void initWifi()
     wifiConfigFile.close();
     Serial.println("Read wifi-config successfully.");
     u8g2log.println("Read wifi-config successfully");
-    u8g2log.println("File:/wifi-config.json");
+    u8g2log.println("/wifi-config.json");
   }
   else
   {
     Serial.println("Read wifi-config failed. Use default.");
     u8g2log.println("Read failed.Use default.");
-    u8g2log.println("File:/wifi-config.json");
+    u8g2log.println("/wifi-config.json");
   }
   WiFi.mode(wifi_mode);
   if (wifi_mode > 1)
@@ -147,46 +171,224 @@ void initWifi()
   {
     WiFi.begin(STAssid, STApassword);
   }
-  Serial.print("Wifi set done! Mode:");
-  Serial.println(wifi_mode);
-  Serial.print("AP_SSID:");
-  Serial.println(APssid);
-  Serial.print("AP_Password:");
-  Serial.println(APpassword);
-  Serial.print("STA_SSID:");
-  Serial.println(STAssid);
-  u8g2log.print("Wifi set done! Mode:");
-  u8g2log.println(wifi_mode);
-  u8g2log.print("AP_SSID:");
-  u8g2log.println(APssid);
-  u8g2log.print("AP_Password:");
-  u8g2log.println(APpassword);
+  DBG_OUTPUT_PORT.println(String("Wifi set done!Mode:")+String(wifi_mode)+String("\nAP_SSID:")+String(APssid)+String("\nAP_Password")+String(APpassword)+String("\nSTA_SSID:")+String(STAssid));
+  u8g2log.println(String("Wifi set done!Mode:")+String(wifi_mode)+String("\nAP_SSID:")+String(APssid)+String("\nAP_Password")+String(APpassword)+String("\nSTA_SSID:")+String(STAssid));
+}
+
+void deleteRecursive(String path)
+{
+  File file = fileSystem->open(path, "r");
+  bool isDir = file.isDirectory();
+  file.close();
+
+  // If it's a plain file, delete it
+  if (!isDir)
+  {
+    fileSystem->remove(path);
+    return;
+  }
+
+  // Otherwise delete its contents first
+  Dir dir = fileSystem->openDir(path);
+
+  while (dir.next())
+  {
+    deleteRecursive(path + '/' + dir.fileName());
+  }
+
+  // Then delete the folder itself
+  fileSystem->rmdir(path);
 }
 
 void handleRoot()
 {
-  u8g2log.println((String)"HTTP Request on "+(String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
   char temp[1024];
-  char checked[][8]={"","",""};
-  strcpy(checked[wifi_mode-1],"checked");
+  char checked[][8] = {"", "", ""};
+  strcpy(checked[wifi_mode - 1], "checked");
   snprintf(temp, 1024, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP8266 Config Page</title></head><body>\
-<form><h2>WiFi Mode Select</h2><input type=\"radio\" name=\"mode\" value=\"1\" %s>STA</br>\
-<input type=\"radio\" name=\"mode\" value=\"2\" %s>AP</br>\
-<input type=\"radio\" name=\"mode\" value=\"3\" %s>STA+AP</br>\
+<form action=\"submit_config\" method=\"post\">\
+<h2>WiFi Mode Select</h2><label><input type=\"radio\" name=\"mode\" value=\"1\" %s>STA</label></br>\
+<label><input type=\"radio\" name=\"mode\" value=\"2\" %s>AP</label></br>\
+<label><input type=\"radio\" name=\"mode\" value=\"3\" %s>STA+AP</label></br>\
 <h3>STA Mode Configuration</h3></br>SSID: <input type=\"text\" name=\"STASSID\" value=\"%s\"></br>\
 Password: <input type=\"text\" name=\"STApassword\" value=\"%s\"></br>\
 <h3>AP Mode Configuration</h3></br>SSID: <input type=\"text\" name=\"APSSID\" value=\"%s\"></br>\
 Password: <input type=\"text\" name=\"APpassword\" value=\"%s\"></br>\
 <h3>Server Configuration</h3>\
 Server: <input type=\"text\" name=\"Server\"></br>Port: <input type=\"text\" name=\"Port\">\
+<input type=\"submit\" value=\"Submit\">\
 </form></body></html>\
 ",
-           checked[0],checked[1],checked[2],STAssid, STApassword,APssid, APpassword);
+           checked[0], checked[1], checked[2], STAssid, STApassword, APssid, APpassword);
   server.send(200, "text/html", temp);
+}
+
+void handleSubmitConfig()
+{
+  DBG_OUTPUT_PORT.println((String) "HTTP Request on " + (String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
+  if (!fsOK)
+  {
+    return replyServerError(FPSTR(FS_INIT_ERROR));
+  }
+  if (server.method() != HTTP_POST)
+  {
+    server.send(405, "text/plain", "Method Not Allowed");
+  }
+  else
+  {
+    DynamicJsonBuffer postargsbuf;
+    JsonObject &postargs = postargsbuf.createObject();
+    String message = "POST form was:\n";
+    for (uint8_t i = 0; i < server.args(); i++)
+    {
+      message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+      postargs.set(server.argName(i), server.arg(i));
+    }
+    if (postargs.containsKey("WIFI"))
+    {
+    }
+    server.send(200, "text/plain", message);
+  }
+}
+
+String lastExistingParent(String path)
+{
+  while (!path.isEmpty() && !fileSystem->exists(path))
+  {
+    if (path.lastIndexOf('/') > 0)
+    {
+      path = path.substring(0, path.lastIndexOf('/'));
+    }
+    else
+    {
+      path = String(); // No slash => the top folder does not exist
+    }
+  }
+  DBG_OUTPUT_PORT.println(String("Last existing parent: ") + path);
+  return path;
+}
+
+void handleFileList()
+{
+  DBG_OUTPUT_PORT.println((String) "HTTP Request on " + (String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
+  if (!fsOK)
+  {
+    return replyServerError(FPSTR(FS_INIT_ERROR));
+  }
+
+  if (!server.hasArg("dir"))
+  {
+    return replyBadRequest(F("DIR ARG MISSING"));
+  }
+
+  String path = server.arg("dir");
+  if (path != "/" && !fileSystem->exists(path))
+  {
+    return replyBadRequest("BAD PATH");
+  }
+
+  DBG_OUTPUT_PORT.println(String("handleFileList: ") + path);
+  Dir dir = fileSystem->openDir(path);
+  path.clear();
+
+  // use HTTP/1.1 Chunked response to avoid building a huge temporary string
+  if (!server.chunkedResponseModeStart(200, "text/json"))
+  {
+    server.send(505, F("text/html"), F("HTTP1.1 required"));
+    return;
+  }
+
+  // use the same string for every line
+  String output;
+  output.reserve(64);
+  while (dir.next())
+  {
+#ifdef USE_SPIFFS
+    String error = checkForUnsupportedPath(dir.fileName());
+    if (error.length() > 0)
+    {
+      DBG_OUTPUT_PORT.println(String("Ignoring ") + error + dir.fileName());
+      continue;
+    }
+#endif
+    if (output.length())
+    {
+      // send string from previous iteration
+      // as an HTTP chunk
+      server.sendContent(output);
+      output = ',';
+    }
+    else
+    {
+      output = '[';
+    }
+
+    output += "{\"type\":\"";
+    if (dir.isDirectory())
+    {
+      output += "dir";
+    }
+    else
+    {
+      output += F("file\",\"size\":\"");
+      output += dir.fileSize();
+    }
+
+    output += F("\",\"name\":\"");
+    // Always return names without leading "/"
+    if (dir.fileName()[0] == '/')
+    {
+      output += &(dir.fileName()[1]);
+    }
+    else
+    {
+      output += dir.fileName();
+    }
+
+    output += "\"}";
+  }
+
+  // send last string
+  output += "]";
+  server.sendContent(output);
+  server.chunkedResponseFinalize();
+}
+
+void handleFileDelete()
+{
+  DBG_OUTPUT_PORT.println((String) "HTTP Request on " + (String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
+  if (!fsOK)
+  {
+    return replyServerError(FPSTR(FS_INIT_ERROR));
+  }
+  if (server.method() != HTTP_POST)
+  {
+    server.send(405, "text/plain", "Method Not Allowed");
+  }
+  String path = server.arg(0);
+  if (path.isEmpty() || path == "/")
+  {
+    return replyBadRequest("BAD PATH");
+  }
+
+  DBG_OUTPUT_PORT.println(String("handleFileDelete: ") + path);
+  if (!fileSystem->exists(path))
+  {
+    return replyNotFound(FPSTR(FILE_NOT_FOUND));
+  }
+  deleteRecursive(path);
+
+  replyOKWithMsg(lastExistingParent(path));
 }
 
 void handleNotFound()
 {
+  DBG_OUTPUT_PORT.println((String) "HTTP Request on " + (String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
   String message = "File Not Found\n\n";
   message += "URI: ";
   message += server.uri();
@@ -209,13 +411,11 @@ void handleNotFound()
 */
 void handleFileUpload()
 {
+  DBG_OUTPUT_PORT.println((String) "HTTP Request on " + (String)server.uri());
+  u8g2log.println((String) "HTTP Request on " + (String)server.uri());
   if (!fsOK)
   {
     return replyServerError(FPSTR(FS_INIT_ERROR));
-  }
-  if (server.uri() != "/edit")
-  {
-    return;
   }
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START)
@@ -272,11 +472,11 @@ void setup()
   //u8g2.enableUTF8Print();
   ////////////////////////////////
   // FILESYSTEM INIT
-  fileSystemConfig.setAutoFormat(false);
+  fileSystemConfig.setAutoFormat(true);
   fileSystem->setConfig(fileSystemConfig);
   fsOK = fileSystem->begin();
   DBG_OUTPUT_PORT.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
-
+  u8g2log.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
   initWifi(); /*
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -290,10 +490,13 @@ void setup()
   delay(100);
 
   server.on("/", handleRoot);
+  server.on("/api/submit_config", handleSubmitConfig);
+  server.on("/api/list", handleFileList);
+  server.on("/api/delete", handleFileDelete);
   // Upload file
   // - first callback is called after the request has ended with all parsed arguments
   // - second callback handles file upload at that location
-  server.on("/edit", HTTP_POST, replyOK, handleFileUpload);
+  server.on("/api/upload", HTTP_POST, replyOK, handleFileUpload);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("HTTP server started");
