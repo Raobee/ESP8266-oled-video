@@ -2,8 +2,15 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
+#ifdef ESP8266
+#define ESP8266_DRD_USE_RTC false //true
+#define ESP_DRD_USE_LITTLEFS true //false
+#endif
+#define DOUBLERESETDETECTOR_DEBUG true //false
+#include <ESP_DoubleResetDetector.h>
 
 // Display lib U8G2 settings, default with hardware I2C
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
@@ -43,6 +50,10 @@ SDFSConfig fileSystemConfig = SDFSConfig();
 #error Please select a filesystem first by uncommenting one of the "#define USE_xxx" lines at the beginning of the sketch.
 #endif
 
+#define DRD_TIMEOUT 10U
+// RTC Memory Address for the DoubleResetDetector to use
+#define DRD_ADDRESS 0
+DoubleResetDetector *drd;
 #define DBG_OUTPUT_PORT Serial
 static bool fsOK;
 String unsupportedFiles = String();
@@ -51,6 +62,8 @@ static const char TEXT_PLAIN[] PROGMEM = "text/plain";
 static const char FS_INIT_ERROR[] PROGMEM = "FS INIT ERROR";
 static const char FILE_NOT_FOUND[] PROGMEM = "FileNotFound";
 ESP8266WebServer server(80);
+HTTPClient http;
+WiFiClient client;
 //Wifi settings
 WiFiMode_t wifi_mode = WIFI_AP; //default work in AP mode
 char APssid[64] = "esp8266AP";
@@ -66,6 +79,8 @@ uint8_t LocalFileFPS = 5;            //default local player FPS
 char Client_Server_Address[64] = ""; //default Client-mode Server address
 int Client_Server_Port = 8002;       //default Client-mode Server port
 int Server_Listen_Port = 8001;       //default Server-mode Server port
+
+bool startFlag = true;
 
 #ifdef USE_SPIFFS
 /*
@@ -242,8 +257,8 @@ void initWifi()
   {
     WiFi.begin(STAssid, STApassword);
   }
-  DBG_OUTPUT_PORT.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
-  u8g2log.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
+  DBG_OUTPUT_PORT.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password:") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
+  u8g2log.println(String("Wifi set done!Mode:") + String(wifi_mode) + String("\nAP_SSID:") + String(APssid) + String("\nAP_Password:") + String(APpassword) + String("\nSTA_SSID:") + String(STAssid));
 }
 
 void deleteRecursive(String path)
@@ -302,8 +317,9 @@ Port: <input type=\"text\" name=\"Player_Client_Port\" value=\"%d\"></br>\
 Port: <input type=\"text\" name=\"Player_Server_Port\" value=\"%d\"></br>\
 <input type=\"submit\" value=\"Submit\">\
 </form></body></html>\
-",wifi_checked[0], wifi_checked[1], wifi_checked[2], STAssid, STApassword, APssid, APpassword,
-player_checked[0], player_checked[1], player_checked[2],LocalFilePath,LocalFileFPS,Client_Server_Address,Client_Server_Port,Server_Listen_Port);
+",
+           wifi_checked[0], wifi_checked[1], wifi_checked[2], STAssid, STApassword, APssid, APpassword,
+           player_checked[0], player_checked[1], player_checked[2], LocalFilePath, LocalFileFPS, Client_Server_Address, Client_Server_Port, Server_Listen_Port);
   server.send(200, "text/html", temp);
 }
 
@@ -621,8 +637,62 @@ void freshDisplay()
   } while (u8g2.nextPage());
 }
 
-void ClientMode()
+void processRes(const char *resJson)
 {
+  DynamicJsonBuffer jsbf;
+  //Serial.println("Start to parse");
+  JsonObject &resObj = jsbf.parseObject(resJson);
+  //Serial.println("Parse done");
+  if (resObj.containsKey("displayHex"))
+  {
+    //Serial.println("PrepareToConvert");
+    hex2byte(imgmem, (char *)resObj["displayHex"].as<char *>());
+    //Serial.println("PrepareToFresh");
+    freshDisplay();
+    jsbf.clear();
+  }
+}
+
+void PlayerLocalMode()
+{
+  return;
+}
+
+void PlayerClientMode()
+{
+  DBG_OUTPUT_PORT.println("PlayerClientMode");
+  http.begin(client, String("http://") + String(Client_Server_Address) + String(Client_Server_Port)); //HTTP
+  http.addHeader("Content-Type", "application/json");
+  char postData[64] = "";
+  sprintf(postData, "%s%lu%s", "{\"millis\":", millis(), "}");
+  if (startFlag)
+  {
+    DBG_OUTPUT_PORT.println("Start to client play");
+    sprintf(postData, "%s%lu%s", "{\"millis\":", millis(), ",\"start\":\"true\"}");
+    startFlag = false;
+  }
+  int httpCode = http.POST(postData);
+
+  // httpCode will be negative on error
+  if (httpCode > 0)
+  {
+    // HTTP header has been send and Server response header has been handled
+    Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+    // file found at server
+    if (httpCode == HTTP_CODE_OK)
+    {
+      const String &payload = http.getString();
+      processRes(payload.c_str());
+      delay(10);
+      return;
+    }
+  }
+  http.end();
+}
+
+void PlayerServerMode()
+{
+  return;
 }
 
 void setup()
@@ -646,13 +716,56 @@ void setup()
   fsOK = fileSystem->begin();
   DBG_OUTPUT_PORT.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
   u8g2log.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
-  readConfig(); // Read configs
-  initWifi(); /*
-  while (WiFi.status() != WL_CONNECTED)
+  drd = new DoubleResetDetector(DRD_TIMEOUT, DRD_ADDRESS);
+  if (drd->detectDoubleReset())
   {
-    delay(500);
-    Serial.print(".");
-  }*/
+    DBG_OUTPUT_PORT.println("** Double reset boot **");
+    if (fileSystem->begin())
+    {
+      delay(1000);
+      fileSystem->remove("/wifi-config.json");
+      fileSystem->remove("/player-config.json");
+      fileSystem->end();
+      delay(1000);
+    }
+    ESP.reset();
+  }
+
+  readConfig(); // Read configs
+  initWifi();
+  if (wifi_mode == WIFI_STA)
+  {
+    int count = 0;
+    do
+    {
+      delay(500);
+      count++;
+      if (count >= 30)
+      {
+        wifi_mode = WIFI_AP;
+        WiFi.mode(WIFI_OFF);
+        initWifi();
+        break;
+      }
+    } while (WiFi.status() != WL_CONNECTED);
+  }
+  else if (wifi_mode == WIFI_AP_STA)
+  {
+    int count = 0;
+    do
+    {
+      delay(500);
+      count++;
+      if (count >= 30)
+      {
+        wifi_mode = WIFI_AP;
+        WiFi.mode(WIFI_OFF);
+        initWifi();
+        break;
+      }
+    } while (WiFi.status() != WL_CONNECTED);
+  }
+
   if (MDNS.begin("esp8266"))
   {
     Serial.println("MDNS responder started");
@@ -672,8 +785,41 @@ void setup()
   Serial.println("HTTP server started");
 }
 
+bool drdStopFlag = false;
+
 void loop()
 {
+  if (millis() < 10000)
+  {
+    drd->loop();
+  }else if(!drdStopFlag)
+  {
+    drd->stop();
+    drdStopFlag = true;
+  }
+  
+  if ((WiFi.getMode() == WIFI_STA) && (WiFi.status() != WL_CONNECTED))
+  {
+    DBG_OUTPUT_PORT.println("STA mode:Not connected!");
+    delay(500);
+    return;
+  }
   server.handleClient();
   MDNS.update();
+
+  DBG_OUTPUT_PORT.println(player_mode);
+  if (player_mode == 1)
+  {
+    PlayerLocalMode();
+  }
+  else if (player_mode == 2)
+  {
+    PlayerClientMode();
+  }
+  else if (player_mode == 3)
+  {
+    PlayerServerMode();
+  }
+
+  delay(100);
 }
